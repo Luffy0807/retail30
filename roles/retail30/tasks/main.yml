@@ -27,7 +27,18 @@
     update_cache: yes
 
 # --- артефакты: dt ---
+
+- name: Defaults (avoid undefined vars)
+  set_fact:
+    mode: "{{ mode | default('restore_dt') }}"
+    prev_sha: ""
+    restore_needed: false
+    create_empty: "{{ create_empty | default(true) }}"
+    force_restore: "{{ force_restore | default(false) }}"
+  changed_when: false
+
 - name: Stat DT on controller
+  when: mode == "restore_dt"
   delegate_to: localhost
   stat:
     path: "{{ dt_src }}"
@@ -35,29 +46,39 @@
   register: dt_local
 
 - name: Ensure DT dir exists on target
+  when: mode == "restore_dt"
   file:
     path: "{{ dt_dest | dirname }}"
     state: directory
     mode: "0755"
 
 - name: Sync DT to target (rsync, no dumb copies)
+  when: mode == "restore_dt" and not ansible_check_mode
   synchronize:
     src: "{{ dt_src }}"
     dest: "{{ dt_dest }}"
     archive: yes
     checksum: yes
 
-- name: Read previous DT sha on target (if any)
-  slurp:
+- name: Stat DT sha state file
+  stat:
     path: "{{ state_file }}"
-  register: prev_sha_raw
-  ignore_errors: true
+  register: sha_state
+  when: mode == "restore_dt"
+
+- name: Read previous DT sha on target (if any)
+  when: mode == "restore_dt"
+  shell: |
+    cat "{{ state_file }}" 2>/dev/null || true
+  register: prev_sha_cmd
+  changed_when: false
+  check_mode: no
 
 - name: Set prev_sha fact
+  when: mode == "restore_dt"
   set_fact:
-    prev_sha: "{{ (prev_sha_raw.content | b64decode | trim) if (prev_sha_raw is defined and prev_sha_raw.content is defined) else '' }}"
+    prev_sha: "{{ prev_sha_cmd.stdout | trim }}"
 
-# --- бинарники 1С ---
 - name: Check rac exists
   stat:
     path: "/opt/1cv8/x86_64/{{ onec_ver }}/rac"
@@ -73,6 +94,7 @@
         mode: "0755"
 
     - name: Sync 1C debs to target
+      when: not ansible_check_mode
       synchronize:
         src: "{{ deb_1c_dir }}/"
         dest: "/tmp/retail30_deb_1c/"
@@ -80,6 +102,7 @@
         checksum: yes
 
     - name: Install 1C debs
+      when: not ansible_check_mode
       shell: |
         set -e
         apt-get update -y
@@ -96,16 +119,22 @@
 
 # --- получить cluster uuid ---
 - name: Get cluster uuid
+  when: rac_bin.stat.exists
   shell: |
     set -e
-    /opt/1cv8/x86_64/{{ onec_ver }}/rac cluster list {{ ras }} | awk -F': ' '$1=="cluster"{print $2; exit}'
+    /opt/1cv8/x86_64/{{ onec_ver }}/rac cluster list {{ ras }}       | sed -n 's/^cluster[[:space:]]*:[[:space:]]*//p'       | head -n 1
   register: cluster_uuid
   changed_when: false
+  check_mode: no
 
 - name: Fail if cluster uuid empty
   fail:
     msg: "Cannot get CLUSTER_UUID from rac cluster list {{ ras }}"
-  when: cluster_uuid.stdout | trim == ""
+  when:
+    - rac_bin.stat.exists
+    - not ansible_check_mode
+    - (cluster_uuid.stdout | trim) == ""
+
 
 # --- идемпотентность: если dt не менялся и force_restore=false, можно не переливать ---
 - name: Check db exists
@@ -122,13 +151,14 @@
   changed_when: false
 
 - name: Decide restore_needed
+  when: mode == "restore_dt"
   set_fact:
     restore_needed: >-
       {{
         force_restore
-        or (prev_sha != dt_local.stat.checksum)
-        or (db_exists.stdout | trim != "1")
-        or (ib_exists.stdout | trim != "1")
+        or ((prev_sha | default('')) != (dt_local.stat.checksum | default('')))
+        or ((db_exists.stdout | trim) != "1")
+        or ((ib_exists.stdout | trim) != "1")
       }}
 # --- bootstrap empty ---
 - name: Bootstrap empty infobase (no DT)
@@ -211,7 +241,7 @@
         executable: /bin/bash
 # --- restore ---
 - name: Restore DT to PostgreSQL + register (single pass)
-  when: mode == "restore_dt" and restore_needed
+  when: mode == "restore_dt" and restore_needed and not ansible_check_mode
   block:
     - name: Drop infobase registration by name (if exists)
       shell: |
@@ -242,7 +272,7 @@
       args:
 # --- restore ---
 - name: Restore DT to PostgreSQL + register (single pass)
-  when: mode == "restore_dt" and restore_needed
+  when: mode == "restore_dt" and restore_needed and not ansible_check_mode
   block:
     - name: Drop infobase registration by name (if exists)
       shell: |
@@ -365,8 +395,9 @@
 - name: Show results
   debug:
     msg:
-      - "restore_needed={{ restore_needed }}"
-      - "DT sha (controller)={{ dt_local.stat.checksum }}"
+      - "mode={{ mode | default('restore_dt') }}"
+      - "restore_needed={{ restore_needed | default(false) }}"
+      - "DT sha (controller)={{ (dt_local.stat.checksum | default('n/a')) }}"
       - "{{ db_size.stdout }}"
       - "{{ tbl_cnt.stdout }}"
       - "{{ ib_list.stdout }}"
