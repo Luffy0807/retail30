@@ -1,0 +1,28 @@
+# ====== ВХОДНЫЕ ПАРАМЕТРЫ (правишь ТОЛЬКО ЭТО) ======
+
+onec_ver: "8.3.27.1989"
+
+db_name: "retail30"
+db_user: "retail30"
+db_pwd: "Portkkm_123"     # лучше в vault, но ты хотел просто
+
+db_server: "localhost"
+ras: "localhost:1545"
+locale: "ru"
+
+fqdn: "1s-test.portkkm.local"
+host_ip: "192.168.2.202"
+
+# Артефакты на КОНТРОЛЛЕРЕ (не на таргете)
+dt_src: "/srv/artifacts/retail30/dt/1Cv8.dt"
+deb_1c_dir: "/srv/artifacts/retail30/deb/1c"
+deb_pg_dir: "/srv/artifacts/retail30/deb/pg"
+
+# Куда складывать на ТАРГЕТЕ
+dt_dest: "/var/lib/retail30/1Cv8.dt"
+work_dir: "/var/lib/retail30"
+log_dir: "/var/log/retail30"
+state_file: "/var/lib/retail30/dt.sha256"
+
+# 1 = всегда переливать заново
+force_restore: false

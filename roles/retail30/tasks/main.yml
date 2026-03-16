@@ -1,0 +1,270 @@
+- name: Ensure base dirs
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ work_dir }}"
+    - "{{ log_dir }}"
+
+- name: Fix /etc/hosts fqdn -> ip (avoid 127.0.1.1 garbage)
+  lineinfile:
+    path: /etc/hosts
+    regexp: '^\s*{{ host_ip }}\s+{{ fqdn }}\b'
+    line: "{{ host_ip }} {{ fqdn }} {{ fqdn.split('.')[0] }}"
+    state: present
+
+- name: Remove 127.0.1.1 mapping for fqdn if exists
+  lineinfile:
+    path: /etc/hosts
+    regexp: '^\s*127\.0\.1\.1\s+{{ fqdn }}\b.*$'
+    state: absent
+
+- name: Ensure rsync present (needed for synchronize)
+  apt:
+    name: rsync
+    state: present
+    update_cache: yes
+
+# --- артефакты: dt ---
+- name: Stat DT on controller
+  delegate_to: localhost
+  stat:
+    path: "{{ dt_src }}"
+    checksum_algorithm: sha256
+  register: dt_local
+
+- name: Ensure DT dir exists on target
+  file:
+    path: "{{ dt_dest | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Sync DT to target (rsync, no dumb copies)
+  synchronize:
+    src: "{{ dt_src }}"
+    dest: "{{ dt_dest }}"
+    archive: yes
+    checksum: yes
+
+- name: Read previous DT sha on target (if any)
+  slurp:
+    path: "{{ state_file }}"
+  register: prev_sha_raw
+  ignore_errors: true
+
+- name: Set prev_sha fact
+  set_fact:
+    prev_sha: "{{ (prev_sha_raw.content | b64decode | trim) if (prev_sha_raw is defined and prev_sha_raw.content is defined) else '' }}"
+
+# --- бинарники 1С ---
+- name: Check rac exists
+  stat:
+    path: "/opt/1cv8/x86_64/{{ onec_ver }}/rac"
+  register: rac_bin
+
+- name: Install 1C debs if missing (local deb dir on controller -> tmp -> install)
+  when: not rac_bin.stat.exists
+  block:
+    - name: Create temp dir for 1C debs
+      file:
+        path: "/tmp/retail30_deb_1c"
+        state: directory
+        mode: "0755"
+
+    - name: Sync 1C debs to target
+      synchronize:
+        src: "{{ deb_1c_dir }}/"
+        dest: "/tmp/retail30_deb_1c/"
+        archive: yes
+        checksum: yes
+
+    - name: Install 1C debs
+      shell: |
+        set -e
+        apt-get update -y
+        apt-get install -y /tmp/retail30_deb_1c/*.deb
+      args:
+        executable: /bin/bash
+
+# --- сервис 1С ---
+- name: Start 1C service
+  systemd:
+    name: "srv1cv8-{{ onec_ver }}@default.service"
+    state: started
+    enabled: true
+
+# --- получить cluster uuid ---
+- name: Get cluster uuid
+  shell: |
+    set -e
+    /opt/1cv8/x86_64/{{ onec_ver }}/rac cluster list {{ ras }} | awk -F': ' '$1=="cluster"{print $2; exit}'
+  register: cluster_uuid
+  changed_when: false
+
+- name: Fail if cluster uuid empty
+  fail:
+    msg: "Cannot get CLUSTER_UUID from rac cluster list {{ ras }}"
+  when: cluster_uuid.stdout | trim == ""
+
+# --- идемпотентность: если dt не менялся и force_restore=false, можно не переливать ---
+- name: Check db exists
+  shell: |
+    sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}';" | tr -d '[:space:]'
+  register: db_exists
+  changed_when: false
+
+- name: Check infobase exists in cluster
+  shell: |
+    sudo -u usr1cv8 /opt/1cv8/x86_64/{{ onec_ver }}/rac infobase summary list --cluster="{{ cluster_uuid.stdout | trim }}" "{{ ras }}" \
+      | grep -qE "^name\\s+: {{ db_name }}\\b" && echo 1 || echo 0
+  register: ib_exists
+  changed_when: false
+
+- name: Decide restore_needed
+  set_fact:
+    restore_needed: >-
+      {{
+        force_restore
+        or (prev_sha != dt_local.stat.checksum)
+        or (db_exists.stdout | trim != "1")
+        or (ib_exists.stdout | trim != "1")
+      }}
+
+# --- restore ---
+- name: Restore DT to PostgreSQL + register (single pass)
+  when: restore_needed
+  block:
+    - name: Drop infobase registration by name (if exists)
+      shell: |
+        set -e
+        BIN="/opt/1cv8/x86_64/{{ onec_ver }}"
+        RAC="$BIN/rac"
+        RAS="{{ ras }}"
+        CL="{{ cluster_uuid.stdout | trim }}"
+        NAME="{{ db_name }}"
+
+        IB_UUID="$(
+          sudo -u usr1cv8 "$RAC" infobase summary list --cluster="$CL" "$RAS" \
+          | awk -F': ' -v n="$NAME" '
+              $1=="infobase"{u=$2}
+              $1=="name" && $2==n{print u; exit}
+            '
+        )"
+        if [ -n "${IB_UUID:-}" ]; then
+          sudo -u usr1cv8 "$RAC" infobase drop --cluster="$CL" --infobase="$IB_UUID" "$RAS" || true
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Drop database
+      shell: |
+        set -e
+        sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS {{ db_name }} WITH (FORCE);"
+      args:
+        executable: /bin/bash
+
+    - name: Ensure role + password + temp superuser
+      shell: |
+        set -e
+        sudo -u postgres psql -d postgres -c "DO \$\$BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{{ db_user }}') THEN
+          CREATE ROLE {{ db_user }} LOGIN PASSWORD '{{ db_pwd }}';
+        ELSE
+          ALTER ROLE {{ db_user }} WITH PASSWORD '{{ db_pwd }}';
+        END IF;
+        END\$\$;"
+        sudo -u postgres psql -d postgres -c "ALTER ROLE {{ db_user }} WITH SUPERUSER;"
+      args:
+        executable: /bin/bash
+
+    - name: ibcmd create+restore (writes log)
+      shell: |
+        set -e
+        BIN="/opt/1cv8/x86_64/{{ onec_ver }}"
+        IBCMD="$BIN/ibcmd"
+        DATA_DIR="{{ work_dir }}/ibcmd_{{ db_name }}_$(date +%F_%H%M%S)"
+        LOG="{{ log_dir }}/ibcmd_{{ db_name }}_create_restore_$(date +%F_%H%M%S).log"
+        mkdir -p "$DATA_DIR"
+
+        sudo -u usr1cv8 "$IBCMD" infobase create \
+          --dbms=PostgreSQL \
+          --db-server="{{ db_server }}" \
+          --db-name="{{ db_name }}" \
+          --db-user="{{ db_user }}" \
+          --db-pwd="{{ db_pwd }}" \
+          --create-database \
+          --restore="{{ dt_dest }}" \
+          --data="$DATA_DIR" \
+          >"$LOG" 2>&1
+
+        echo "$LOG"
+      args:
+        executable: /bin/bash
+      register: restore_log_path
+
+    - name: Register infobase in cluster
+      shell: |
+        set -e
+        BIN="/opt/1cv8/x86_64/{{ onec_ver }}"
+        RAC="$BIN/rac"
+        sudo -u usr1cv8 "$RAC" infobase create \
+          --cluster="{{ cluster_uuid.stdout | trim }}" \
+          --name="{{ db_name }}" \
+          --dbms=PostgreSQL \
+          --db-server="{{ db_server }}" \
+          --db-name="{{ db_name }}" \
+          --db-user="{{ db_user }}" \
+          --db-pwd="{{ db_pwd }}" \
+          --locale="{{ locale }}" \
+          --license-distribution=allow \
+          "{{ ras }}"
+      args:
+        executable: /bin/bash
+
+    - name: Remove superuser
+      shell: |
+        set -e
+        sudo -u postgres psql -d postgres -c "ALTER ROLE {{ db_user }} WITH NOSUPERUSER;"
+      args:
+        executable: /bin/bash
+
+    - name: Write dt sha state
+      copy:
+        dest: "{{ state_file }}"
+        content: "{{ dt_local.stat.checksum }}\n"
+        mode: "0644"
+
+# --- проверки ---
+- name: DB size
+  shell: |
+    sudo -u postgres psql -d postgres -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datname='{{ db_name }}';"
+  register: db_size
+  changed_when: false
+
+- name: Table count
+  shell: |
+    sudo -u postgres psql -d "{{ db_name }}" -c "SELECT count(*) AS tables
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE c.relkind='r'
+      AND n.nspname NOT IN ('pg_catalog','information_schema')
+      AND n.nspname NOT LIKE 'pg_toast%';"
+  register: tbl_cnt
+  changed_when: false
+
+- name: Infobase list
+  shell: |
+    sudo -u usr1cv8 /opt/1cv8/x86_64/{{ onec_ver }}/rac infobase summary list --cluster="{{ cluster_uuid.stdout | trim }}" "{{ ras }}"
+  register: ib_list
+  changed_when: false
+
+- name: Show results
+  debug:
+    msg:
+      - "restore_needed={{ restore_needed }}"
+      - "DT sha (controller)={{ dt_local.stat.checksum }}"
+      - "{{ db_size.stdout }}"
+      - "{{ tbl_cnt.stdout }}"
+      - "{{ ib_list.stdout }}"
+      - "restore log (if ran)={{ restore_log_path.stdout | default('n/a') }}"
