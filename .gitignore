@@ -6,3 +6,4 @@ inventory/host_vars/
 # local editor/backup junk
 roles/retail30/tasks/*.bak.*
 tatus
+*.bak.*
