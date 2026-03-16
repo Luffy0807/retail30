@@ -1,0 +1,9 @@
+---
+- name: Retail30 bootstrap empty DB
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    mode: "bootstrap_empty"
+  roles:
+    - retail30

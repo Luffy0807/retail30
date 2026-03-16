@@ -1,10 +1,11 @@
 # ====== ВХОДНЫЕ ПАРАМЕТРЫ (правишь ТОЛЬКО ЭТО) ======
 
+
 onec_ver: "8.3.27.1989"
 
 db_name: "retail30"
 db_user: "retail30"
-db_pwd: "Portkkm_123"     # лучше в vault, но ты хотел просто
+db_pwd: "Password_123"
 
 db_server: "localhost"
 ras: "localhost:1545"
@@ -26,3 +27,11 @@ state_file: "/var/lib/retail30/dt.sha256"
 
 # 1 = всегда переливать заново
 force_restore: false
+
+
+# режим:
+# bootstrap_empty = создать пустую ИБ
+# restore_dt      = восстановить из DT
+
+# если bootstrap_empty: на сервере создаст пустую базу и зарегистрирует в кластере
+create_empty: true

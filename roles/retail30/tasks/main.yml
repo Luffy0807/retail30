@@ -130,10 +130,9 @@
         or (db_exists.stdout | trim != "1")
         or (ib_exists.stdout | trim != "1")
       }}
-
-# --- restore ---
-- name: Restore DT to PostgreSQL + register (single pass)
-  when: restore_needed
+# --- bootstrap empty ---
+- name: Bootstrap empty infobase (no DT)
+  when: mode == "bootstrap_empty" and create_empty
   block:
     - name: Drop infobase registration by name (if exists)
       shell: |
@@ -163,6 +162,110 @@
         sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS {{ db_name }} WITH (FORCE);"
       args:
         executable: /bin/bash
+
+    - name: Ensure role + password + temp superuser
+      shell: |
+        set -e
+        sudo -u postgres psql -d postgres -c "DO \$\$BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{{ db_user }}') THEN
+          CREATE ROLE {{ db_user }} LOGIN PASSWORD '{{ db_pwd }}';
+        ELSE
+          ALTER ROLE {{ db_user }} WITH PASSWORD '{{ db_pwd }}';
+        END IF;
+        END\$\$;"
+        sudo -u postgres psql -d postgres -c "ALTER ROLE {{ db_user }} WITH SUPERUSER;"
+      args:
+        executable: /bin/bash
+
+    - name: Create empty DB (UTF8) owned by db_user
+      shell: |
+        set -e
+        sudo -u postgres createdb -O "{{ db_user }}" -E UTF8 "{{ db_name }}"
+      args:
+        executable: /bin/bash
+
+    - name: Register empty infobase in cluster
+      shell: |
+        set -e
+        BIN="/opt/1cv8/x86_64/{{ onec_ver }}"
+        RAC="$BIN/rac"
+        sudo -u usr1cv8 "$RAC" infobase create \
+          --cluster="{{ cluster_uuid.stdout | trim }}" \
+          --name="{{ db_name }}" \
+          --dbms=PostgreSQL \
+          --db-server="{{ db_server }}" \
+          --db-name="{{ db_name }}" \
+          --db-user="{{ db_user }}" \
+          --db-pwd="{{ db_pwd }}" \
+          --locale="{{ locale }}" \
+          --license-distribution=allow \
+          "{{ ras }}"
+      args:
+        executable: /bin/bash
+
+    - name: Remove superuser
+      shell: |
+        set -e
+        sudo -u postgres psql -d postgres -c "ALTER ROLE {{ db_user }} WITH NOSUPERUSER;"
+      args:
+        executable: /bin/bash
+# --- restore ---
+- name: Restore DT to PostgreSQL + register (single pass)
+  when: mode == "restore_dt" and restore_needed
+  block:
+    - name: Drop infobase registration by name (if exists)
+      shell: |
+        set -e
+        BIN="/opt/1cv8/x86_64/{{ onec_ver }}"
+        RAC="$BIN/rac"
+        RAS="{{ ras }}"
+        CL="{{ cluster_uuid.stdout | trim }}"
+        NAME="{{ db_name }}"
+
+        IB_UUID="$(
+          sudo -u usr1cv8 "$RAC" infobase summary list --cluster="$CL" "$RAS" \
+          | awk -F': ' -v n="$NAME" '
+              $1=="infobase"{u=$2}
+              $1=="name" && $2==n{print u; exit}
+            '
+        )"
+        if [ -n "${IB_UUID:-}" ]; then
+          sudo -u usr1cv8 "$RAC" infobase drop --cluster="$CL" --infobase="$IB_UUID" "$RAS" || true
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Drop database
+      shell: |
+        set -e
+        sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS {{ db_name }} WITH (FORCE);"
+      args:
+# --- restore ---
+- name: Restore DT to PostgreSQL + register (single pass)
+  when: mode == "restore_dt" and restore_needed
+  block:
+    - name: Drop infobase registration by name (if exists)
+      shell: |
+        set -e
+        BIN="/opt/1cv8/x86_64/{{ onec_ver }}"
+        RAC="$BIN/rac"
+        RAS="{{ ras }}"
+        CL="{{ cluster_uuid.stdout | trim }}"
+        NAME="{{ db_name }}"
+
+        IB_UUID="$(
+          sudo -u usr1cv8 "$RAC" infobase summary list --cluster="$CL" "$RAS" \
+          | awk -F': ' -v n="$NAME" '
+              $1=="infobase"{u=$2}
+              $1=="name" && $2==n{print u; exit}
+            '
+        )"
+        if [ -n "${IB_UUID:-}" ]; then
+          sudo -u usr1cv8 "$RAC" infobase drop --cluster="$CL" --infobase="$IB_UUID" "$RAS" || true
+        fi
+      args:
+        executable: /bin/bash
+
 
     - name: Ensure role + password + temp superuser
       shell: |
@@ -268,3 +371,18 @@
       - "{{ tbl_cnt.stdout }}"
       - "{{ ib_list.stdout }}"
       - "restore log (if ran)={{ restore_log_path.stdout | default('n/a') }}"
+- name: Post-run HELP (Windows next steps)
+  debug:
+    msg:
+      - "=== NEXT STEPS (Windows) ==="
+      - "1) Установи 1С клиента ТОЙ ЖЕ ВЕРСИИ: {{ onec_ver }}"
+      - "2) Открой 1С:Предприятие (толстый/тонкий клиент) или Конфигуратор"
+      - "3) Добавь ИБ по серверу:"
+      - "   Сервер 1С: {{ host_ip }} (или {{ fqdn }})"
+      - "   Имя базы: {{ db_name }}"
+      - "4) Если нужно ЗАГРУЗИТЬ базу с Windows (DT):"
+      - "   - Запусти Конфигуратор -> Администрирование -> Загрузить информационную базу"
+      - "   - Выбери файл .dt на Windows"
+      - "   - Дождись окончания, затем запусти 'Тестирование и исправление' (по желанию)"
+      - "5) Порты должны быть доступны с Windows к серверу {{ host_ip }}: 1540,1541,1560-1591"
+      - "=== END ==="
